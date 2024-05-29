@@ -1,7 +1,7 @@
 // clang-format off
 // # vim: tabstop=2 shiftwidth=2 expandtab
 // Build this with:
-// $ gcc -g -o demo main.c xdg-shell-protocol.c -lwayland-client -lpthread -lvulkan
+// $ gcc -g -o demo main.c xdg-shell-protocol.c -lwayland-client -lpthread -lvulkan -lm
 // Generate the xdg-shell files from protocols with
 // $ wayland-scanner private-code < /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml > xdg-shell-protocol.c
 // $ wayland-scanner client-header < /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml > xdg-shell-client-protocol.h
@@ -19,6 +19,7 @@
 #include "xdg-shell-client-protocol.h" // True suffering is generated code.
 
 #include <assert.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -61,6 +62,7 @@ struct wsi {
 struct vk {
   VkInstance instance;
   VkPhysicalDevice pdev;
+  VkPhysicalDeviceMemoryProperties pmem;
   int32_t gfxIdx;
   VkDevice dev;
   VkQueue gfx;
@@ -71,11 +73,65 @@ struct wsi WSI = {0};
 struct vk VK = {0};
 VkExtensionProperties vkExtensions[64] = {0};
 
+struct vk_buffer {
+  VkBufferCreateInfo ci;
+  VkBuffer buf;
+  VkDeviceSize alloc_size;
+  int32_t memTypeIdx;
+  VkDeviceMemory mem;
+};
+
 VkExtent2D swapSize() {
   return (VkExtent2D){CLAMP(WSI.w, WSI.vk.surfCaps.minImageExtent.width,
                             WSI.vk.surfCaps.maxImageExtent.width),
                       CLAMP(WSI.h, WSI.vk.surfCaps.minImageExtent.height,
                             WSI.vk.surfCaps.maxImageExtent.height)};
+}
+
+int32_t findMemoryIdx(VkPhysicalDeviceMemoryProperties memories,
+                      uint32_t allowed_memories,
+                      VkMemoryPropertyFlags properties) {
+  for (int32_t i = 0; i < memories.memoryTypeCount; i++) {
+    if ((allowed_memories & (1 << i)) &&
+        (memories.memoryTypes[i].propertyFlags & properties) == properties) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+struct vk_buffer vk_buffer_new(VkDeviceSize size, VkBufferUsageFlags usage,
+                               VkMemoryPropertyFlags properties) {
+
+  struct vk_buffer b = {0};
+  b.ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  b.ci.size = size;
+  b.ci.usage = usage;
+  b.ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  VkResult result = vkCreateBuffer(VK.dev, &b.ci, NULL, &b.buf);
+  assert(result == VK_SUCCESS);
+
+  VkMemoryRequirements reqs;
+  vkGetBufferMemoryRequirements(VK.dev, b.buf, &reqs);
+
+  b.alloc_size = reqs.size;
+  b.memTypeIdx = findMemoryIdx(VK.pmem, reqs.memoryTypeBits,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  assert(b.memTypeIdx > -1);
+
+  VkMemoryAllocateInfo allocInfo = {0};
+  allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  allocInfo.allocationSize = b.alloc_size;
+  allocInfo.memoryTypeIndex = b.memTypeIdx;
+
+  result = vkAllocateMemory(VK.dev, &allocInfo, NULL, &b.mem);
+  assert(result == VK_SUCCESS);
+
+  vkBindBufferMemory(VK.dev, b.buf, b.mem, 0);
+
+  return b;
 }
 
 // xdg_wm_base generic callbacks
@@ -175,7 +231,7 @@ static const struct wl_callback_listener wl_surface_frame_callback_listener = {
     .done = wl_surface_frame_done,
 };
 
-void *render_thread(void *data) {}
+void *render_thread(void *data) { return 0; }
 
 VkResult recreate_swapchain() {
   for (uint32_t i = 0; i < WSI.vk.imgCount; i++) {
@@ -291,6 +347,7 @@ int main(int argc, char *argv[]) {
   vkGetPhysicalDeviceProperties(VK.pdev, &deviceProperties);
   VkPhysicalDeviceFeatures deviceFeatures;
   vkGetPhysicalDeviceFeatures(VK.pdev, &deviceFeatures);
+  vkGetPhysicalDeviceMemoryProperties(VK.pdev, &VK.pmem);
 
   // Setup the WSI surface so we can check it against queues.
   VkWaylandSurfaceCreateInfoKHR surfCreateInfo = {0};
@@ -371,6 +428,54 @@ int main(int argc, char *argv[]) {
 
   // Now we can build some shaders and pipelines.
 
+  // Create some descriptor sets
+  // For an OpenGL Experience (tm): You want 32 textures, 16 images, 24 UBOs,
+  // etc. and map bindings into these slots.
+  VkDescriptorSetLayoutBinding uboLayoutBinding = {0};
+  uboLayoutBinding.binding = 0;
+  uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  uboLayoutBinding.descriptorCount = 1;
+  uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+  VkDescriptorSetLayoutCreateInfo layoutInfo = {0};
+  layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  layoutInfo.bindingCount = 1;
+  layoutInfo.pBindings = &uboLayoutBinding;
+
+  VkDescriptorSetLayout descriptorSetLayout;
+  result = vkCreateDescriptorSetLayout(VK.dev, &layoutInfo, NULL,
+                                       &descriptorSetLayout);
+  assert(result == VK_SUCCESS);
+
+  // Pools for all the descriptors we can bind into our layout(s).
+  // Assuming only 1 frame in flight, more needed for more frames.
+  VkDescriptorPoolSize poolSize = {0};
+  poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  poolSize.descriptorCount = 1;
+
+  VkDescriptorPoolCreateInfo descPoolInfo = {0};
+  descPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  descPoolInfo.poolSizeCount = 1;
+  descPoolInfo.pPoolSizes = &poolSize;
+  // how many DescriptorSets we can allocate out of this pool.
+  descPoolInfo.maxSets = 1;
+
+  VkDescriptorPool descriptorPool;
+  result = vkCreateDescriptorPool(VK.dev, &descPoolInfo, NULL, &descriptorPool);
+  assert(result == VK_SUCCESS);
+
+  // Finally allocate the set from the pool for our layout.
+  VkDescriptorSetAllocateInfo descSetAllocInfo = {0};
+  descSetAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  descSetAllocInfo.descriptorPool = descriptorPool;
+  descSetAllocInfo.descriptorSetCount = 1;
+  descSetAllocInfo.pSetLayouts = &descriptorSetLayout;
+
+  VkDescriptorSet descSet;
+  result = vkAllocateDescriptorSets(VK.dev, &descSetAllocInfo, &descSet);
+  assert(result == VK_SUCCESS);
+
+  // Alright actual shader stuff now.
   VkShaderModule fragShader, vertShader;
   VkShaderModuleCreateInfo createShaderInfo = {0};
   createShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -403,13 +508,61 @@ int main(int argc, char *argv[]) {
   dynamicState.dynamicStateCount = ARRAY_SIZEOF(dynamicStates);
   dynamicState.pDynamicStates = dynamicStates;
 
+  // Representation of the packed vertex stage input for use in configuring
+  // shader input. Also VUID-VkVertexInputBindingDescription-stride-04456
+  struct VData {
+    struct {
+      float p1;
+      float p2;
+    } pos;
+    struct {
+      float c1;
+      float c2;
+      float c3;
+    } col;
+  };
+  struct VData vertexIn[3] = {
+      {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+      {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
+      {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+  };
+  struct MData {
+    float m[16];
+  };
+  struct MData matrixIn = {
+      // clang-format off
+      1.f, 0.f, 0.f, 0.f,
+      0.f, 1.f, 0.f, 0.f,
+      0.f, 0.f, 1.f, 0.f,
+      0.f, 0.f, 0.f, 1.f,
+      // clang-format on
+  };
+
+  VkVertexInputBindingDescription vibd = {0};
+  vibd.binding = 0;
+  // TODO: Look up how engines actually figure this for aggregate
+  // types.
+  vibd.stride = sizeof(struct VData);
+  vibd.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+  VkVertexInputAttributeDescription viad[2] = {0};
+  viad[0].binding = 0;
+  viad[0].location = 0;
+  viad[0].format = VK_FORMAT_R32G32_SFLOAT;
+  viad[0].offset = offsetof(struct VData, pos);
+
+  viad[1].binding = 0;
+  viad[1].location = 1;
+  viad[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+  viad[1].offset = offsetof(struct VData, col);
+
   VkPipelineVertexInputStateCreateInfo vertexInputInfo = {0};
   vertexInputInfo.sType =
       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-  vertexInputInfo.vertexBindingDescriptionCount = 0;
-  vertexInputInfo.pVertexBindingDescriptions = NULL; // Optional
-  vertexInputInfo.vertexAttributeDescriptionCount = 0;
-  vertexInputInfo.pVertexAttributeDescriptions = NULL; // Optional
+  vertexInputInfo.vertexBindingDescriptionCount = 1;
+  vertexInputInfo.pVertexBindingDescriptions = &vibd;
+  vertexInputInfo.vertexAttributeDescriptionCount = 2;
+  vertexInputInfo.pVertexAttributeDescriptions = viad;
 
   VkPipelineInputAssemblyStateCreateInfo inputAssembly = {0};
   inputAssembly.sType =
@@ -456,8 +609,8 @@ int main(int argc, char *argv[]) {
   // Empty as vertex data is encoded in the shader.
   VkPipelineLayoutCreateInfo pipelineLayoutInfo = {0};
   pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  pipelineLayoutInfo.setLayoutCount = 0;         // Optional
-  pipelineLayoutInfo.pSetLayouts = NULL;         // Optional
+  pipelineLayoutInfo.setLayoutCount = 1;
+  pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
   pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
   pipelineLayoutInfo.pPushConstantRanges = NULL; // Optional
 
@@ -532,6 +685,48 @@ int main(int argc, char *argv[]) {
                                      NULL, &graphicsPipeline);
   assert(result == VK_SUCCESS);
 
+  // Allocate some pipeline input
+  struct vk_buffer vertexBuffer =
+      vk_buffer_new(sizeof(struct VData) * 3, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+  void *data;
+  vkMapMemory(VK.dev, vertexBuffer.mem, 0, vertexBuffer.ci.size, 0, &data);
+  memcpy(data, vertexIn, (size_t)vertexBuffer.ci.size);
+  vkUnmapMemory(VK.dev, vertexBuffer.mem);
+
+  struct vk_buffer matrixBuffer =
+      vk_buffer_new(sizeof(struct MData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  vkMapMemory(VK.dev, matrixBuffer.mem, 0, matrixBuffer.ci.size, 0, &data);
+  memcpy(data, &matrixIn, (size_t)matrixBuffer.ci.size);
+  // Persistent mapping aka "While a range of device memory is host mapped, the
+  // application is responsible for synchronizing both device and host access to
+  // that memory range."
+  //
+  // vkUnmapMemory(VK.dev, matrixBuffer.mem);
+
+  // Write out buffers into the shader descriptors
+  VkDescriptorBufferInfo bufferInfo = {0};
+  bufferInfo.buffer = matrixBuffer.buf;
+  bufferInfo.offset = 0;
+  bufferInfo.range = matrixBuffer.ci.size;
+
+  VkWriteDescriptorSet descriptorWrite = {0};
+  descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  descriptorWrite.dstSet = descSet;
+  descriptorWrite.dstBinding = 0; // Remember the binding from the shader?
+  descriptorWrite.dstArrayElement = 0;
+  descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  descriptorWrite.descriptorCount = 1;
+  descriptorWrite.pBufferInfo = &bufferInfo;
+  descriptorWrite.pImageInfo = NULL;       // Optional
+  descriptorWrite.pTexelBufferView = NULL; // Optional
+
+  vkUpdateDescriptorSets(VK.dev, 1, &descriptorWrite, 0, NULL);
+
   // Frame buffers for rendering
   for (uint32_t i = 0; i < WSI.vk.imgCount; i++) {
     VkImageView attachments[1] = {WSI.vk.swapImgView[i]};
@@ -556,14 +751,14 @@ int main(int argc, char *argv[]) {
   result = vkCreateCommandPool(VK.dev, &poolInfo, NULL, &VK.cmdPool);
   assert(result == VK_SUCCESS);
 
-  VkCommandBufferAllocateInfo allocInfo = {0};
-  allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  allocInfo.commandPool = VK.cmdPool;
-  allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  allocInfo.commandBufferCount = 1;
+  VkCommandBufferAllocateInfo bufAllocInfo = {0};
+  bufAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  bufAllocInfo.commandPool = VK.cmdPool;
+  bufAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  bufAllocInfo.commandBufferCount = 1;
 
   VkCommandBuffer commandBuffer;
-  vkAllocateCommandBuffers(VK.dev, &allocInfo, &commandBuffer);
+  vkAllocateCommandBuffers(VK.dev, &bufAllocInfo, &commandBuffer);
 
   // Prepare sync objs
   VkSemaphoreCreateInfo semaphoreInfo = {0};
@@ -584,10 +779,12 @@ int main(int argc, char *argv[]) {
 
   // Begin drawing
   WSI.frame_done = true;
+  float frame = 0;
   while (!WSI.window_closed && wl_display_dispatch_pending(WSI.display) != -1) {
     if (!WSI.frame_done)
       continue;
 
+    frame += 1;
     vkWaitForFences(VK.dev, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
     uint32_t imageIndex;
     result = vkAcquireNextImageKHR(VK.dev, WSI.vk.swapchain, UINT64_MAX,
@@ -661,9 +858,26 @@ int main(int argc, char *argv[]) {
     scissor.extent = swapSize();
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
+    float theta = frame * 3.1415f / 200.f;
+    struct MData spin = {
+        // clang-format off
+        cosf(theta), -sinf(theta), 0.f, 0.f,
+        sinf(theta), cosf(theta), 0.f, 0.f,
+        0.f, 0.f, 1.f, 0.f,
+        0.f, 0.f, 0.f, 1.f,
+        // clang-format on
+    };
+    memcpy(data, &spin, (size_t)matrixBuffer.ci.size);
+
     // Set the pipeline to draw through
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       graphicsPipeline);
+
+    // Bind draw data
+    VkDeviceSize offsets[] = {0};
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer.buf, offsets);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipelineLayout, 0, 1, &descSet, 0, NULL);
 
     vkCmdDraw(commandBuffer, 3, 1, 0, 0);
 
